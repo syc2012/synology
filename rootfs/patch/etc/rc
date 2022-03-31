@@ -1,0 +1,238 @@
+#!/bin/sh
+
+HOME=/
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/syno/bin:/usr/syno/sbin:/usr/local/bin:/usr/local/sbin
+export HOME PATH
+
+. /etc/rc.subr
+
+BOOT_SEQ_FILE="/tmp/boot_seq.tmp"
+SEQ_START_ETCRC=1
+SEQ_CHECK_FS=2
+SEQ_START_SERVICE=3
+
+###################################################
+echo "STEP=$SEQ_START_ETCRC" > ${BOOT_SEQ_FILE}
+echo "Starting /etc/rc ..."
+###################################################
+
+LinuxVersion=`/bin/uname -r | /usr/bin/cut -c1-3`
+SYNOLoadModule()
+{
+	for MODULE in ${KERNEL_MODULES}
+	do
+		MODULE_PATH=/lib/modules/${MODULE}
+		if [ -f ${MODULE_PATH} ]; then
+			echo "Load ${MODULE}... "
+			insmod ${MODULE_PATH} > /dev/null 2>&1
+		fi
+	done
+}
+
+
+FStab="fstab"
+
+mount -o remount,rw /
+echo "Mounting proc filesystem..."
+mount -n -t proc /proc /proc
+grep /dev/root /proc/mounts > /etc/mtab
+rm -rf /var/tmp
+ln -s /tmp /var/tmp
+mount -t tmpfs /tmp /tmp
+
+[ -f /initrd/tmp/usbinfoall ] && cp -f /initrd/tmp/usbinfoall /tmp/usbinfoall
+[ -d /initrd ] && [ ! -f /.nofree ] && /bin/umount /initrd && /sbin/freeramdisk /dev/ram0
+
+dmesg > /var/run/dmesg.boot
+
+# turn swap on
+SwapDevice="/dev/hda2"
+
+swapon $SwapDevice
+RetSWAPON=$?
+if [ "$RetSWAPON" -ne 0 ]; then
+	if [ -d /initrd ]; then
+		echo "RetSWAPON=$RetSWAPON, doing mkswap..."
+		mkswap ${SwapDevice}
+		RetMKSWAP=$?
+		if [ "$RetMKSWAP" -ne 0 ]; then
+			echo "Failed to mkswap:$RetMKSWAP, reboot to network install mode"
+			touch "/.noroot"
+			reboot
+		fi
+		swapon $SwapDevice
+	fi
+fi
+
+# show mount_options
+mount -ro /
+
+#ConfList="/etc/defaults/rc.conf /etc/rc.conf"
+ConfList="/etc/sysconfig/network"
+for ThisConfig in $ConfList;
+do
+	if [ -r "$ThisConfig" ]; then
+		. $ThisConfig
+	fi
+done
+
+# Set the host name
+#
+if [ -z "${HOSTNAME}" ]; then
+	HOSTNAME="${hostname:-diskstation}"
+fi
+hostname ${HOSTNAME}
+echo -n "Hostname "
+hostname
+
+grep ${HOSTNAME} /etc/hosts
+if [ "$?" != "0" ]; then
+	echo "0.0.0.0	${HOSTNAME}" >> /etc/hosts
+fi
+
+ThisMachine=`uname -m`
+if [ "x${LinuxVersion}" != "x2.6" ]; then
+	KERNEL_MODULES="appletalk.o fat.o netlink_dev.o reiserfs.o vfat.o ntfs.o scsi_mod.o sd_mod.o sg.o usbcore.o quota_v2.o slhc.o ppp_generic.o ppp_async.o nfsd.o"
+	if [ "${ThisMachine}" = "ppc" ]; then
+		KERNEL_MODULES="${KERNEL_MODULES} soundcore.o snd-page-alloc.o snd.o snd-seq-device.o snd-rawmidi.o snd-usb-lib.o snd-hwdep.o snd-timer.o snd-pcm.o snd-usb-audio.o snd-mixer-oss.o snd-pcm-oss.o zlib_inflate.o udf.o isofs.o"
+	fi
+else
+	KERNEL_MODULES="llc.ko psnap.ko appletalk.ko fat.ko vfat.ko ntfs.ko sg.ko usbcore.ko quota_v2.ko soundcore.ko snd-page-alloc.ko snd.ko snd-seq-device.ko snd-rawmidi.ko snd-usb-lib.ko snd-hwdep.ko snd-timer.ko snd-pcm.ko snd-usb-audio.ko snd-mixer-oss.ko snd-pcm-oss.ko slhc.ko ppp_generic.ko crc-ccitt.ko ppp_async.ko exportfs.ko nfsd.ko fuse.ko zlib_inflate.ko udf.ko isofs.ko ecryptfs.ko"
+fi
+
+SYNOLoadModule
+
+if [ "x${LinuxVersion}" != "x2.6" ]; then
+	echo "Mounting usbdevfs..."
+	mount -t usbdevfs /proc/bus/usb /proc/bus/usb
+else
+	echo "Mounting sysfs..."
+	mount -t sysfs /sys /sys
+	echo "Mounting usbfs..."
+	mount -t usbfs /proc/bus/usb /proc/bus/usb
+fi
+
+	if [ "x${LinuxVersion}" != "x2.6" ]; then
+		insmod /lib/modules/sk98lin.o
+	else
+		if [ -f /lib/modules/sk98lin.ko ]; then
+			insmod /lib/modules/sk98lin.ko
+		elif [ -f /lib/modules/skge.ko ]; then
+			insmod /lib/modules/skge.ko
+		fi
+	fi
+
+RunSynoBios=`/bin/get_key_value /etc/synoinfo.conf synobios`
+if [ "no" != "$RunSynoBios" ]; then
+	echo "Load synobios...."
+	if [ "x${LinuxVersion}" != "x2.6" ]; then
+		insmod /lib/modules/synobios.o
+	else
+		insmod /lib/modules/synobios.ko
+	fi
+	cd /dev
+	/bin/mknod synobios c 201 0
+	cd $CWD
+fi
+
+for PidDir in /var/run /etc/dhcpc;
+do
+	rm -rf ${PidDir}/*.pid
+done
+
+rm -f /usr/syno/etc/private/*.tmp.*
+
+
+## remove samba's tdb of usbprinter.tdb in each reboot to clean out of control job ##
+## see DS20 #1340
+if [ -e "/var/run/printing/usbprinter.tdb" ]; then
+	rm -rf /var/run/printing/usbprinter.tdb
+fi
+
+if [ -x /etc/rc.network -a "${NETWORKING}" = "yes" ]; then
+	/etc/rc.network start
+fi
+
+syslogd_enable="YES"
+syslogd_flags="-S"
+case ${syslogd_enable} in
+[Yy][Ee][Ss])
+	# Transitional symlink (for the next couple of years :) until all
+	# binaries have had a chance to move towards /var/run/log.
+	if [ ! -L /dev/log ]; then
+		# might complain for r/o root f/s
+		ln -sf /var/run/log /dev/log
+	fi
+
+	rm -f /var/run/log
+	echo "Starting syslogd..."
+	${syslogd_program:-/sbin/syslogd} ${syslogd_flags}
+	/sbin/klogd
+	;;
+esac
+
+for CFGEN in /usr/syno/cfgen/*;
+do
+	if [ -x "$CFGEN" ]; then
+		$CFGEN
+	fi
+done
+
+###################################################
+echo "STEP=$SEQ_CHECK_FS" > ${BOOT_SEQ_FILE}
+echo "Checking and Mounting filesystem(s) ..."
+###################################################
+
+#set time zone information to kernel
+/usr/syno/bin/synokerneltz
+
+ulimit -c unlimited
+
+#check /var/service/blog for Photo Station Blog
+if [ ! -d /var/services/blog ]; then
+	mkdir -p /var/services/blog
+	chown -R admin /var/services/blog
+	chmod -R 755 /var/services/blog
+fi
+
+/usr/syno/bin/synologset1 sys info 0x11100002
+
+# Remove upsmaster before hotplug
+grep -v upsmaster /etc/synoinfo.conf > /tmp/synoinfo.tmp
+mv /tmp/synoinfo.tmp /etc/synoinfo.conf
+
+###################################################
+echo "STEP=$SEQ_START_SERVICE" > ${BOOT_SEQ_FILE}
+###################################################
+
+if [ -x /etc/rc.network -a "${NETWORKING}" = "yes" ]; then
+	# Start PPPoE if enabled
+	/etc/rc.network start-pppoe
+fi
+
+if [ ! -d /initrd ]; then
+	echo "Starting inetd in flash_rd..."
+	/usr/sbin/inetd
+fi
+
+# For bug 1248, probe USB device after scemd
+# usb-uhci.o is for VIA, usb-ohci.o is for NEC
+# KERNEL_MODULES="ehci-hcd.o usb-uhci.o usb-storage.o printer.o"
+if [ "x${LinuxVersion}" != "x2.6" ]; then
+KERNEL_MODULES="ehci-hcd.o usb-ohci.o usb-uhci.o usb-storage.o printer.o hid.o"
+else
+KERNEL_MODULES="ehci-hcd.ko ohci-hcd.ko uhci-hcd.ko usb-storage.ko usblp.ko input-core.ko hid.ko usbhid.ko"
+fi
+SYNOLoadModule
+
+if [ -r /etc/rc.local ]; then
+	echo -n 'Starting local daemons:'
+	sh /etc/rc.local
+	echo '.'
+fi
+
+echo "done."
+
+date
+
+exit 0
